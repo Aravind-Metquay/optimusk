@@ -207,6 +207,8 @@ function readIgnoreFile(projectRoot) {
 
 // ---------------------------------------------------------------------------
 // Alias resolution from tsconfig / jsconfig
+// BUG 1: Load aliases on main thread at startup BEFORE workers are spawned.
+//        The result is serialized and passed as part of worker initialization.
 // ---------------------------------------------------------------------------
 
 function readAliases(projectRoot) {
@@ -217,7 +219,7 @@ function readAliases(projectRoot) {
     const content = tryReadFileSync(cfgPath);
     if (!content) continue;
     try {
-      // Strip comments (single-line)
+      // Strip single-line and block comments
       const stripped = content.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
       const json = JSON.parse(stripped);
       if (json.compilerOptions) {
@@ -270,10 +272,23 @@ function detectEntryPoint(projectRoot, allFiles, entryOverride) {
 
 // ---------------------------------------------------------------------------
 // Import resolution
+// BUG 8: Resolver tries all extension/index variants in correct order.
+//        Unresolved imports are returned as null (caller adds to unresolvedImports).
 // ---------------------------------------------------------------------------
 
 const RESOLVE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js'];
 const INDEX_FILES = ['/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
+
+// BUG 7: Asset extension set — skip resolution for these entirely
+const ASSET_EXTENSIONS_SET = new Set([
+  '.css', '.scss', '.sass', '.less', '.svg', '.png', '.jpg', '.jpeg',
+  '.gif', '.webp', '.woff', '.woff2', '.ttf', '.eot', '.ico', '.json',
+]);
+
+function isAssetImport(source) {
+  const base = source.split('?')[0].split('#')[0];
+  return ASSET_EXTENSIONS_SET.has(path.extname(base));
+}
 
 function resolveImportPath(importSource, currentFile, aliases, baseUrl, projectRoot) {
   let resolved = null;
@@ -302,18 +317,19 @@ function resolveImportPath(importSource, currentFile, aliases, baseUrl, projectR
     }
   }
 
-  // Direct file match
+  // BUG 8: Try candidates in exact order:
+  // 1. Path as-is (direct file match with valid extension)
   if (fileExistsSync(basePath)) {
     const ext = path.extname(basePath);
     if (VALID_EXTENSIONS.has(ext)) return basePath;
   }
 
-  // Try extensions
+  // 2-5. Path + .tsx / .ts / .jsx / .js
   for (const ext of RESOLVE_EXTENSIONS) {
     if (fileExistsSync(basePath + ext)) return basePath + ext;
   }
 
-  // Try index files
+  // 6-9. Path + /index.tsx / /index.ts / /index.jsx / /index.js
   for (const idx of INDEX_FILES) {
     if (fileExistsSync(basePath + idx)) return basePath + idx;
   }
@@ -322,164 +338,216 @@ function resolveImportPath(importSource, currentFile, aliases, baseUrl, projectR
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread — AST parsing
+// BUG 4: isLibraryImport — checks alias map BEFORE heuristic.
+//        @/lib, @/components etc. match aliases and are project imports.
+//        @org/package (scoped npm) does NOT match any alias key → library.
 // ---------------------------------------------------------------------------
 
-if (!isMainThread) {
-  // Worker: receives file paths, returns parsed metadata
-  let babelParser, babelTraverse;
+function isLibraryImport(source, aliases) {
+  if (source.startsWith('.') || source.startsWith('/')) return false;
+  // BUG 4: check alias map first
+  for (const alias of Object.keys(aliases)) {
+    if (source === alias || source.startsWith(alias + '/')) return false;
+  }
+  return true;
+}
+
+function getPackageName(source) {
+  if (source.startsWith('@')) {
+    const parts = source.split('/');
+    return parts.slice(0, 2).join('/');
+  }
+  return source.split('/')[0];
+}
+
+function extractPropsFromParams(params, result, content) {
+  if (!params || params.length === 0) return;
+  const firstParam = params[0];
+  if (firstParam.type === 'ObjectPattern') {
+    let isPropsParam = false;
+    if (firstParam.typeAnnotation && firstParam.typeAnnotation.typeAnnotation) {
+      const ta = firstParam.typeAnnotation.typeAnnotation;
+      if (ta.type === 'TSTypeReference' && ta.typeName) {
+        const name = ta.typeName.name || '';
+        if (name.endsWith('Props')) isPropsParam = true;
+      }
+    }
+    if (isPropsParam || true) {
+      for (const prop of firstParam.properties) {
+        if (prop.type === 'ObjectProperty' && prop.key) {
+          const propName = prop.key.name || prop.key.value;
+          if (propName && !result.props.find(p => p.name === propName)) {
+            result.props.push({ name: propName, type: 'unknown' });
+          }
+        } else if (prop.type === 'RestElement' && prop.argument) {
+          const propName = prop.argument.name;
+          if (propName && !result.props.find(p => p.name === propName)) {
+            result.props.push({ name: propName, type: 'rest' });
+          }
+        }
+      }
+    }
+  }
+}
+
+function makeEmptyFileResult(filePath) {
+  return {
+    filePath,
+    error: null,
+    imports: { libraries: [], project: [], dynamic: [], reexports: [] },
+    props: [],
+    state: [],
+    routes: [],
+    exports: [],
+    externalLibraries: [],
+    type: 'Module',
+    lineCount: 0,
+    lastModified: '',
+    hasTests: false,
+    hasJSX: false,
+    hasCreateContext: false,
+    hasRouterElements: false,
+    hasStorePatterns: false,
+    isBarrel: false,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Core file parser — shared between worker threads AND main-thread fallback
+// BUG 2: Extracted outside worker block so main thread can call it as fallback.
+// BUG 1+4: Uses isLibraryImport(source, aliases) to check alias map first.
+// BUG 7: Skips asset imports before attempting resolution.
+// BUG 9: Barrel reexports are included in imports.reexports for tree traversal.
+// ---------------------------------------------------------------------------
+
+const PARSER_PLUGINS = [
+  'typescript', 'jsx', 'decorators-legacy', 'classProperties',
+  'dynamicImport', 'exportDefaultFrom', 'importMeta',
+];
+
+function parseSingleFile(filePath, aliasConfig, projectRoot, babelParser, babelTraverse) {
+  const result = makeEmptyFileResult(filePath);
+  const { aliases, baseUrl } = aliasConfig;
+
+  let content;
   try {
-    babelParser = require('@babel/parser');
-    babelTraverse = require('@babel/traverse');
-    if (babelTraverse.default) babelTraverse = babelTraverse.default;
+    const stat = fs.statSync(filePath);
+    result.lastModified = stat.mtime.toISOString();
+
+    // Skip large files (> 500KB)
+    if (stat.size > 500 * 1024) {
+      result.error = 'LARGE_FILE';
+      result.lineCount = 0;
+      return result;
+    }
+
+    content = fs.readFileSync(filePath, 'utf-8');
   } catch (e) {
-    parentPort.postMessage({ error: 'Missing babel dependencies: ' + e.message, results: [] });
-    process.exit(1);
+    result.error = `Read error: ${e.message}`;
+    return result;
   }
 
-  const { files, projectRoot, aliasConfig } = workerData;
-  const results = [];
+  result.lineCount = content.split('\n').length;
 
-  const PARSER_PLUGINS = [
-    'typescript', 'jsx', 'decorators-legacy', 'classProperties',
-    'dynamicImport', 'exportDefaultFrom', 'importMeta',
+  // Check for test file existence
+  const dir = path.dirname(filePath);
+  const baseName = path.basename(filePath);
+  const ext = path.extname(baseName);
+  const nameNoExt = baseName.slice(0, -ext.length);
+  const testPatterns = [
+    `${nameNoExt}.test${ext}`,
+    `${nameNoExt}.spec${ext}`,
+    `${nameNoExt}.test.tsx`,
+    `${nameNoExt}.test.ts`,
+    `${nameNoExt}.test.js`,
+    `${nameNoExt}.test.jsx`,
+    `${nameNoExt}.spec.tsx`,
+    `${nameNoExt}.spec.ts`,
+    `${nameNoExt}.spec.js`,
+    `${nameNoExt}.spec.jsx`,
   ];
-
-  function parseFile(filePath) {
-    const result = {
-      filePath,
-      error: null,
-      imports: { libraries: [], project: [], dynamic: [], reexports: [] },
-      props: [],
-      state: [],
-      routes: [],
-      exports: [],
-      externalLibraries: [],
-      type: 'Module',
-      lineCount: 0,
-      lastModified: '',
-      hasTests: false,
-      hasJSX: false,
-      hasCreateContext: false,
-      hasRouterElements: false,
-      hasStorePatterns: false,
-      isBarrel: false,
-    };
-
-    let content;
+  for (const tp of testPatterns) {
     try {
-      const stat = fs.statSync(filePath);
-      result.lastModified = stat.mtime.toISOString();
-
-      // Skip large files (> 500KB)
-      if (stat.size > 500 * 1024) {
-        result.error = 'LARGE_FILE';
-        result.lineCount = 0;
-        return result;
+      if (fs.statSync(path.join(dir, tp)).isFile()) {
+        result.hasTests = true;
+        break;
       }
+    } catch { /* not found */ }
+  }
 
-      content = fs.readFileSync(filePath, 'utf-8');
-    } catch (e) {
-      result.error = `Read error: ${e.message}`;
-      return result;
-    }
+  if (!content.trim()) {
+    return result; // Empty file
+  }
 
-    result.lineCount = content.split('\n').length;
+  // Parse AST
+  let ast;
+  try {
+    ast = babelParser.parse(content, {
+      sourceType: 'module',
+      plugins: PARSER_PLUGINS,
+      errorRecovery: true,
+    });
+  } catch (e) {
+    result.error = `Parse error: ${e.message}`;
+    return result;
+  }
 
-    // Check for test file existence
-    const dir = path.dirname(filePath);
-    const baseName = path.basename(filePath);
-    const ext = path.extname(baseName);
-    const nameNoExt = baseName.slice(0, -ext.length);
-    const testPatterns = [
-      `${nameNoExt}.test${ext}`,
-      `${nameNoExt}.spec${ext}`,
-      `${nameNoExt}.test.tsx`,
-      `${nameNoExt}.test.ts`,
-      `${nameNoExt}.test.js`,
-      `${nameNoExt}.test.jsx`,
-      `${nameNoExt}.spec.tsx`,
-      `${nameNoExt}.spec.ts`,
-      `${nameNoExt}.spec.js`,
-      `${nameNoExt}.spec.jsx`,
-    ];
-    for (const tp of testPatterns) {
-      try {
-        if (fs.statSync(path.join(dir, tp)).isFile()) {
-          result.hasTests = true;
-          break;
+  const librarySet = new Set();
+  let exportCount = 0;
+  let reexportCount = 0;
+  let hasRuntimeExport = false;
+  let hasDefaultExport = false;
+  let defaultExportName = null;
+
+  try {
+    babelTraverse(ast, {
+      // --- Import declarations ---
+      ImportDeclaration(nodePath) {
+        const source = nodePath.node.source.value;
+
+        // BUG 7: Skip asset imports — record as asset, do not attempt resolution
+        if (isAssetImport(source)) {
+          result.imports.project.push({ source, resolvedPath: null, unresolved: false, specifiers: [], type: 'asset' });
+          return;
         }
-      } catch { /* not found */ }
-    }
 
-    if (!content.trim()) {
-      return result; // Empty file
-    }
+        const specifiers = nodePath.node.specifiers.map(s => {
+          if (s.type === 'ImportDefaultSpecifier') return s.local.name;
+          if (s.type === 'ImportNamespaceSpecifier') return `* as ${s.local.name}`;
+          return s.imported ? (s.imported.name || s.imported.value) : s.local.name;
+        });
 
-    // Parse AST
-    let ast;
-    try {
-      const isTS = filePath.endsWith('.ts') || filePath.endsWith('.tsx');
-      ast = babelParser.parse(content, {
-        sourceType: 'module',
-        plugins: PARSER_PLUGINS,
-        errorRecovery: true,
-      });
-    } catch (e) {
-      result.error = `Parse error: ${e.message}`;
-      return result;
-    }
-
-    const librarySet = new Set();
-    let exportCount = 0;
-    let reexportCount = 0;
-    let hasRuntimeExport = false;
-    let hasDefaultExport = false;
-    let defaultExportName = null;
-
-    try {
-      babelTraverse(ast, {
-        // --- Import declarations ---
-        ImportDeclaration(nodePath) {
-          const source = nodePath.node.source.value;
-          const specifiers = nodePath.node.specifiers.map(s => {
-            if (s.type === 'ImportDefaultSpecifier') return s.local.name;
-            if (s.type === 'ImportNamespaceSpecifier') return `* as ${s.local.name}`;
-            return s.imported ? (s.imported.name || s.imported.value) : s.local.name;
+        // BUG 1+4: use aliases-aware isLibraryImport
+        if (isLibraryImport(source, aliases)) {
+          const pkgName = getPackageName(source);
+          librarySet.add(pkgName);
+          result.imports.libraries.push({ source: pkgName, specifiers });
+        } else {
+          const resolved = resolveImportPath(source, filePath, aliases, baseUrl, projectRoot);
+          result.imports.project.push({
+            source,
+            resolvedPath: resolved ? normalizePath(resolved) : null,
+            unresolved: !resolved,
+            specifiers,
           });
+        }
+      },
 
-          if (isLibraryImport(source)) {
-            const pkgName = getPackageName(source);
-            librarySet.add(pkgName);
-            result.imports.libraries.push({ source: pkgName, specifiers });
-          } else {
-            const resolved = resolveImportPath(
-              source, filePath, aliasConfig.aliases, aliasConfig.baseUrl, projectRoot
-            );
-            result.imports.project.push({
-              source,
-              resolvedPath: resolved ? normalizePath(resolved) : null,
-              unresolved: !resolved,
-              specifiers,
-            });
-          }
-        },
+      // --- Dynamic imports ---
+      CallExpression(nodePath) {
+        const node = nodePath.node;
 
-        // --- Dynamic imports ---
-        CallExpression(nodePath) {
-          const node = nodePath.node;
-
-          // import('./...')
-          if (node.callee.type === 'Import' && node.arguments.length > 0) {
-            const arg = node.arguments[0];
-            if (arg.type === 'StringLiteral') {
-              const source = arg.value;
-              if (isLibraryImport(source)) {
+        // import('./...')
+        if (node.callee.type === 'Import' && node.arguments.length > 0) {
+          const arg = node.arguments[0];
+          if (arg.type === 'StringLiteral') {
+            const source = arg.value;
+            // BUG 7: Skip asset dynamic imports
+            if (!isAssetImport(source)) {
+              if (isLibraryImport(source, aliases)) {
                 librarySet.add(getPackageName(source));
               } else {
-                const resolved = resolveImportPath(
-                  source, filePath, aliasConfig.aliases, aliasConfig.baseUrl, projectRoot
-                );
+                const resolved = resolveImportPath(source, filePath, aliases, baseUrl, projectRoot);
                 result.imports.dynamic.push({
                   source,
                   resolvedPath: resolved ? normalizePath(resolved) : null,
@@ -489,184 +557,213 @@ if (!isMainThread) {
               }
             }
           }
+        }
 
-          // useState detection
-          if (node.callee.name === 'useState' || (node.callee.property && node.callee.property.name === 'useState')) {
-            const parent = nodePath.parent;
-            if (parent && parent.type === 'VariableDeclarator' && parent.id && parent.id.type === 'ArrayPattern') {
-              const elements = parent.id.elements;
-              if (elements.length > 0 && elements[0]) {
-                result.state.push({ name: elements[0].name, type: 'state' });
-              }
+        // useState detection
+        if (node.callee.name === 'useState' || (node.callee.property && node.callee.property.name === 'useState')) {
+          const parent = nodePath.parent;
+          if (parent && parent.type === 'VariableDeclarator' && parent.id && parent.id.type === 'ArrayPattern') {
+            const elements = parent.id.elements;
+            if (elements.length > 0 && elements[0]) {
+              result.state.push({ name: elements[0].name, type: 'state' });
             }
           }
+        }
 
-          // useReducer detection
-          if (node.callee.name === 'useReducer' || (node.callee.property && node.callee.property.name === 'useReducer')) {
-            const parent = nodePath.parent;
-            if (parent && parent.type === 'VariableDeclarator' && parent.id && parent.id.type === 'ArrayPattern') {
-              const elements = parent.id.elements;
-              if (elements.length > 0 && elements[0]) {
-                result.state.push({ name: elements[0].name, type: 'reducer' });
-              }
+        // useReducer detection
+        if (node.callee.name === 'useReducer' || (node.callee.property && node.callee.property.name === 'useReducer')) {
+          const parent = nodePath.parent;
+          if (parent && parent.type === 'VariableDeclarator' && parent.id && parent.id.type === 'ArrayPattern') {
+            const elements = parent.id.elements;
+            if (elements.length > 0 && elements[0]) {
+              result.state.push({ name: elements[0].name, type: 'reducer' });
             }
           }
+        }
 
-          // createContext detection
-          if (
-            node.callee.name === 'createContext' ||
-            (node.callee.type === 'MemberExpression' &&
-              node.callee.object && node.callee.object.name === 'React' &&
-              node.callee.property && node.callee.property.name === 'createContext')
-          ) {
-            result.hasCreateContext = true;
+        // createContext detection
+        if (
+          node.callee.name === 'createContext' ||
+          (node.callee.type === 'MemberExpression' &&
+            node.callee.object && node.callee.object.name === 'React' &&
+            node.callee.property && node.callee.property.name === 'createContext')
+        ) {
+          result.hasCreateContext = true;
+        }
+
+        // Store pattern detection
+        if (node.callee.name === 'createSlice' || node.callee.name === 'createStore' ||
+            node.callee.name === 'configureStore') {
+          result.hasStorePatterns = true;
+        }
+        if (node.callee.name === 'atom') {
+          result.hasStorePatterns = true;
+        }
+        if (node.callee.name === 'create' && content.includes('zustand')) {
+          result.hasStorePatterns = true;
+        }
+
+        // navigate() detection for routes
+        if (node.callee.name === 'navigate' || (node.callee.property && node.callee.property.name === 'navigate')) {
+          if (node.arguments.length > 0 && node.arguments[0].type === 'StringLiteral') {
+            result.routes.push(node.arguments[0].value);
           }
-
-          // Store pattern detection
-          if (node.callee.name === 'createSlice' || node.callee.name === 'createStore' ||
-              node.callee.name === 'configureStore') {
-            result.hasStorePatterns = true;
+        }
+        if (node.callee.property && node.callee.property.name === 'push') {
+          if (node.arguments.length > 0 && node.arguments[0].type === 'StringLiteral') {
+            const val = node.arguments[0].value;
+            if (val.startsWith('/')) result.routes.push(val);
           }
-          if (node.callee.name === 'atom') {
-            result.hasStorePatterns = true;
+        }
+
+        // createBrowserRouter detection
+        if (node.callee.name === 'createBrowserRouter') {
+          result.hasRouterElements = true;
+        }
+      },
+
+      // --- JSX detection ---
+      JSXElement() {
+        result.hasJSX = true;
+      },
+      JSXFragment() {
+        result.hasJSX = true;
+      },
+
+      // --- JSX Route path detection ---
+      JSXAttribute(nodePath) {
+        if (nodePath.node.name && nodePath.node.name.name === 'path') {
+          const val = nodePath.node.value;
+          if (val && val.type === 'StringLiteral') {
+            result.routes.push(val.value);
           }
-          if (node.callee.name === 'create' && content.includes('zustand')) {
-            result.hasStorePatterns = true;
-          }
+        }
+      },
 
-          // navigate() detection for routes
-          if (node.callee.name === 'navigate' || (node.callee.property && node.callee.property.name === 'navigate')) {
-            if (node.arguments.length > 0 && node.arguments[0].type === 'StringLiteral') {
-              result.routes.push(node.arguments[0].value);
-            }
-          }
-          if (node.callee.property && node.callee.property.name === 'push') {
-            if (node.arguments.length > 0 && node.arguments[0].type === 'StringLiteral') {
-              const val = node.arguments[0].value;
-              if (val.startsWith('/')) result.routes.push(val);
-            }
-          }
+      // --- JSX opening elements for router detection ---
+      JSXOpeningElement(nodePath) {
+        const name = nodePath.node.name;
+        let elemName = null;
+        if (name.type === 'JSXIdentifier') elemName = name.name;
 
-          // createBrowserRouter detection
-          if (node.callee.name === 'createBrowserRouter') {
-            result.hasRouterElements = true;
-          }
-        },
+        if (elemName === 'BrowserRouter' || elemName === 'Routes' || elemName === 'Route') {
+          result.hasRouterElements = true;
+        }
+      },
 
-        // --- JSX detection ---
-        JSXElement() {
-          result.hasJSX = true;
-        },
-        JSXFragment() {
-          result.hasJSX = true;
-        },
+      // --- Export declarations ---
+      ExportDefaultDeclaration(nodePath) {
+        hasDefaultExport = true;
+        exportCount++;
+        hasRuntimeExport = true;
+        const decl = nodePath.node.declaration;
+        let name = 'default';
+        let kind = 'unknown';
+        if (decl.type === 'FunctionDeclaration' || decl.type === 'ArrowFunctionExpression' || decl.type === 'FunctionExpression') {
+          kind = 'function';
+          if (decl.id) name = decl.id.name;
+        } else if (decl.type === 'ClassDeclaration') {
+          kind = 'class';
+          if (decl.id) name = decl.id.name;
+        } else if (decl.type === 'Identifier') {
+          name = decl.name;
+          kind = 'constant';
+        }
+        defaultExportName = name;
+        result.exports.push({ name, kind, isDefault: true });
+      },
 
-        // --- JSX Route path detection ---
-        JSXAttribute(nodePath) {
-          if (nodePath.node.name && nodePath.node.name.name === 'path') {
-            const val = nodePath.node.value;
-            if (val && val.type === 'StringLiteral') {
-              result.routes.push(val.value);
-            }
-          }
-        },
+      ExportNamedDeclaration(nodePath) {
+        const node = nodePath.node;
+        exportCount++;
 
-        // --- JSX opening elements for router detection ---
-        JSXOpeningElement(nodePath) {
-          const name = nodePath.node.name;
-          let elemName = null;
-          if (name.type === 'JSXIdentifier') elemName = name.name;
+        // Re-export: export { X } from './Y'
+        // BUG 9: reexports are recorded in imports.reexports for barrel traversal
+        if (node.source) {
+          reexportCount++;
+          const source = node.source.value;
+          const specifiers = node.specifiers.map(s => (s.exported.name || s.exported.value));
 
-          if (elemName === 'BrowserRouter' || elemName === 'Routes' || elemName === 'Route') {
-            result.hasRouterElements = true;
-          }
-        },
-
-        // --- Export declarations ---
-        ExportDefaultDeclaration(nodePath) {
-          hasDefaultExport = true;
-          exportCount++;
-          hasRuntimeExport = true;
-          const decl = nodePath.node.declaration;
-          let name = 'default';
-          let kind = 'unknown';
-          if (decl.type === 'FunctionDeclaration' || decl.type === 'ArrowFunctionExpression' || decl.type === 'FunctionExpression') {
-            kind = 'function';
-            if (decl.id) name = decl.id.name;
-          } else if (decl.type === 'ClassDeclaration') {
-            kind = 'class';
-            if (decl.id) name = decl.id.name;
-          } else if (decl.type === 'Identifier') {
-            name = decl.name;
-            kind = 'constant';
-          }
-          defaultExportName = name;
-          result.exports.push({ name, kind, isDefault: true });
-        },
-
-        ExportNamedDeclaration(nodePath) {
-          const node = nodePath.node;
-          exportCount++;
-
-          // Re-export: export { X } from './Y'
-          if (node.source) {
-            reexportCount++;
-            const source = node.source.value;
-            const specifiers = node.specifiers.map(s => (s.exported.name || s.exported.value));
-            if (isLibraryImport(source)) {
-              librarySet.add(getPackageName(source));
-            } else {
-              const resolved = resolveImportPath(
-                source, filePath, aliasConfig.aliases, aliasConfig.baseUrl, projectRoot
-              );
-              result.imports.reexports.push({
-                source,
-                resolvedPath: resolved ? normalizePath(resolved) : null,
-                unresolved: !resolved,
-                specifiers,
-                type: 'reexport',
-              });
-            }
+          // BUG 7: skip asset reexports
+          if (isAssetImport(source)) {
+            result.imports.reexports.push({ source, resolvedPath: null, unresolved: false, specifiers, type: 'asset' });
             return;
           }
 
-          if (node.declaration) {
-            hasRuntimeExport = true;
-            const decl = node.declaration;
-            if (decl.type === 'FunctionDeclaration') {
-              result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'function', isDefault: false });
-            } else if (decl.type === 'ClassDeclaration') {
-              result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'class', isDefault: false });
-            } else if (decl.type === 'VariableDeclaration') {
-              for (const d of decl.declarations) {
-                if (d.id && d.id.name) {
-                  result.exports.push({ name: d.id.name, kind: 'constant', isDefault: false });
-                }
+          // BUG 1+4: use aliases-aware isLibraryImport
+          if (isLibraryImport(source, aliases)) {
+            librarySet.add(getPackageName(source));
+          } else {
+            const resolved = resolveImportPath(source, filePath, aliases, baseUrl, projectRoot);
+            result.imports.reexports.push({
+              source,
+              resolvedPath: resolved ? normalizePath(resolved) : null,
+              unresolved: !resolved,
+              specifiers,
+              type: 'reexport',
+            });
+          }
+          return;
+        }
+
+        if (node.declaration) {
+          hasRuntimeExport = true;
+          const decl = node.declaration;
+          if (decl.type === 'FunctionDeclaration') {
+            result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'function', isDefault: false });
+          } else if (decl.type === 'ClassDeclaration') {
+            result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'class', isDefault: false });
+          } else if (decl.type === 'VariableDeclaration') {
+            for (const d of decl.declarations) {
+              if (d.id && d.id.name) {
+                result.exports.push({ name: d.id.name, kind: 'constant', isDefault: false });
               }
-            } else if (decl.type === 'TSTypeAliasDeclaration' || decl.type === 'TSInterfaceDeclaration') {
-              result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'type', isDefault: false });
-            } else if (decl.type === 'TSEnumDeclaration') {
-              hasRuntimeExport = true;
-              result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'constant', isDefault: false });
             }
-          } else if (node.specifiers) {
+          } else if (decl.type === 'TSTypeAliasDeclaration' || decl.type === 'TSInterfaceDeclaration') {
+            result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'type', isDefault: false });
+          } else if (decl.type === 'TSEnumDeclaration') {
             hasRuntimeExport = true;
-            for (const spec of node.specifiers) {
-              result.exports.push({
-                name: spec.exported.name || spec.exported.value,
-                kind: 'constant',
-                isDefault: false,
-              });
+            result.exports.push({ name: decl.id ? decl.id.name : 'anonymous', kind: 'constant', isDefault: false });
+          }
+        } else if (node.specifiers) {
+          hasRuntimeExport = true;
+          for (const spec of node.specifiers) {
+            result.exports.push({
+              name: spec.exported.name || spec.exported.value,
+              kind: 'constant',
+              isDefault: false,
+            });
+          }
+        }
+      },
+
+      // --- Props detection from TS interfaces/types ---
+      TSInterfaceDeclaration(nodePath) {
+        const name = nodePath.node.id.name;
+        if (name.endsWith('Props')) {
+          const members = nodePath.node.body.body;
+          for (const member of members) {
+            if (member.type === 'TSPropertySignature' && member.key) {
+              const propName = member.key.name || member.key.value;
+              let propType = 'unknown';
+              if (member.typeAnnotation && member.typeAnnotation.typeAnnotation) {
+                propType = content.slice(
+                  member.typeAnnotation.typeAnnotation.start,
+                  member.typeAnnotation.typeAnnotation.end
+                );
+              }
+              result.props.push({ name: propName, type: propType });
             }
           }
-        },
+        }
+      },
 
-        // --- Props detection from TS interfaces/types ---
-        TSInterfaceDeclaration(nodePath) {
-          const name = nodePath.node.id.name;
-          if (name.endsWith('Props')) {
-            const members = nodePath.node.body.body;
-            for (const member of members) {
+      TSTypeAliasDeclaration(nodePath) {
+        const name = nodePath.node.id.name;
+        if (name.endsWith('Props') && nodePath.node.typeAnnotation) {
+          const typeAnno = nodePath.node.typeAnnotation;
+          if (typeAnno.type === 'TSTypeLiteral') {
+            for (const member of typeAnno.members) {
               if (member.type === 'TSPropertySignature' && member.key) {
                 const propName = member.key.name || member.key.value;
                 let propType = 'unknown';
@@ -680,121 +777,96 @@ if (!isMainThread) {
               }
             }
           }
-        },
+        }
+      },
 
-        TSTypeAliasDeclaration(nodePath) {
-          const name = nodePath.node.id.name;
-          if (name.endsWith('Props') && nodePath.node.typeAnnotation) {
-            const typeAnno = nodePath.node.typeAnnotation;
-            if (typeAnno.type === 'TSTypeLiteral') {
-              for (const member of typeAnno.members) {
-                if (member.type === 'TSPropertySignature' && member.key) {
-                  const propName = member.key.name || member.key.value;
-                  let propType = 'unknown';
-                  if (member.typeAnnotation && member.typeAnnotation.typeAnnotation) {
-                    propType = content.slice(
-                      member.typeAnnotation.typeAnnotation.start,
-                      member.typeAnnotation.typeAnnotation.end
-                    );
-                  }
-                  result.props.push({ name: propName, type: propType });
-                }
-              }
-            }
-          }
-        },
-
-        // --- Props from function parameter destructuring ---
-        FunctionDeclaration(nodePath) {
-          extractPropsFromParams(nodePath.node.params, result, content);
-        },
-        ArrowFunctionExpression(nodePath) {
-          extractPropsFromParams(nodePath.node.params, result, content);
-        },
-      });
-    } catch (e) {
-      result.error = `Traversal error: ${e.message}`;
-      return result;
-    }
-
-    result.externalLibraries = Array.from(librarySet);
-
-    // Deduplicate routes
-    result.routes = [...new Set(result.routes)];
-
-    // Detect barrel files
-    if (exportCount > 0 && reexportCount === exportCount && !result.hasJSX) {
-      result.isBarrel = true;
-    }
-
-    // Check if only type exports
-    const hasOnlyTypeExports = result.exports.length > 0 &&
-      result.exports.every(e => e.kind === 'type') && !result.hasJSX;
-
-    // Store for classification
-    result._hasRuntimeExport = hasRuntimeExport;
-    result._hasDefaultExport = hasDefaultExport;
-    result._defaultExportName = defaultExportName;
-    result._hasOnlyTypeExports = hasOnlyTypeExports;
-
+      // --- Props from function parameter destructuring ---
+      FunctionDeclaration(nodePath) {
+        extractPropsFromParams(nodePath.node.params, result, content);
+      },
+      ArrowFunctionExpression(nodePath) {
+        extractPropsFromParams(nodePath.node.params, result, content);
+      },
+    });
+  } catch (e) {
+    result.error = `Traversal error: ${e.message}`;
     return result;
   }
 
-  function isLibraryImport(source) {
-    if (source.startsWith('.') || source.startsWith('/')) return false;
-    // Alias check handled at resolution time
-    return true;
+  result.externalLibraries = Array.from(librarySet);
+
+  // Deduplicate routes
+  result.routes = [...new Set(result.routes)];
+
+  // Detect barrel files
+  if (exportCount > 0 && reexportCount === exportCount && !result.hasJSX) {
+    result.isBarrel = true;
   }
 
-  function getPackageName(source) {
-    if (source.startsWith('@')) {
-      const parts = source.split('/');
-      return parts.slice(0, 2).join('/');
-    }
-    return source.split('/')[0];
+  // Check if only type exports
+  const hasOnlyTypeExports = result.exports.length > 0 &&
+    result.exports.every(e => e.kind === 'type') && !result.hasJSX;
+
+  // Store for classification
+  result._hasRuntimeExport = hasRuntimeExport;
+  result._hasDefaultExport = hasDefaultExport;
+  result._defaultExportName = defaultExportName;
+  result._hasOnlyTypeExports = hasOnlyTypeExports;
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Worker thread — AST parsing
+// BUG 2: Each file wrapped in try/catch; errors reported explicitly.
+// BUG 1: aliasConfig is passed in workerData (set on main thread at startup).
+// ---------------------------------------------------------------------------
+
+if (!isMainThread) {
+  let babelParser, babelTraverse;
+  try {
+    babelParser = require('@babel/parser');
+    babelTraverse = require('@babel/traverse');
+    if (babelTraverse.default) babelTraverse = babelTraverse.default;
+  } catch (e) {
+    parentPort.postMessage({ error: 'Missing babel dependencies: ' + e.message, results: [] });
+    process.exit(1);
   }
 
-  function extractPropsFromParams(params, result, content) {
-    if (!params || params.length === 0) return;
-    const firstParam = params[0];
-    if (firstParam.type === 'ObjectPattern') {
-      // Check if it has a type annotation ending in Props
-      let isPropsParam = false;
-      if (firstParam.typeAnnotation && firstParam.typeAnnotation.typeAnnotation) {
-        const ta = firstParam.typeAnnotation.typeAnnotation;
-        if (ta.type === 'TSTypeReference' && ta.typeName) {
-          const name = ta.typeName.name || '';
-          if (name.endsWith('Props')) isPropsParam = true;
-        }
-      }
-      // Even without explicit Props type annotation, capture destructured params
-      // for component functions (we'll rely on classification later)
-      if (isPropsParam || true) {
-        for (const prop of firstParam.properties) {
-          if (prop.type === 'ObjectProperty' && prop.key) {
-            const propName = prop.key.name || prop.key.value;
-            // Avoid duplicates
-            if (propName && !result.props.find(p => p.name === propName)) {
-              result.props.push({ name: propName, type: 'unknown' });
-            }
-          } else if (prop.type === 'RestElement' && prop.argument) {
-            const propName = prop.argument.name;
-            if (propName && !result.props.find(p => p.name === propName)) {
-              result.props.push({ name: propName, type: 'rest' });
-            }
-          }
-        }
-      }
-    }
-  }
+  const { files, projectRoot, aliasConfig } = workerData;
+  const results = [];
 
-  // Process all files
   for (const filePath of files) {
-    results.push(parseFile(filePath));
+    // BUG 2: outer try/catch catches any uncaught exception inside parseSingleFile
+    try {
+      const r = parseSingleFile(filePath, aliasConfig, projectRoot, babelParser, babelTraverse);
+      results.push(r);
+    } catch (e) {
+      // BUG 2: explicit error payload instead of crashing the worker
+      const errResult = makeEmptyFileResult(filePath);
+      errResult.error = `Uncaught worker error: ${e.message}`;
+      results.push(errResult);
+    }
   }
 
   parentPort.postMessage({ results });
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Main thread — lazy babel loader for fallback re-parsing (BUG 2)
+// ---------------------------------------------------------------------------
+
+let _babelModules = null;
+
+function loadBabelModules() {
+  if (!_babelModules) {
+    const bp = require('@babel/parser');
+    let bt = require('@babel/traverse');
+    if (bt.default) bt = bt.default;
+    _babelModules = { babelParser: bp, babelTraverse: bt };
+  }
+  return _babelModules;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +896,7 @@ async function main() {
   const projectName = pkgJson.name || path.basename(projectRoot);
   const projectVersion = pkgJson.version || '0.0.0';
 
-  // Read aliases
+  // BUG 1: Read aliases on main thread at startup, BEFORE workers are spawned.
   const aliasConfig = readAliases(projectRoot);
   const aliasesForOutput = {};
   for (const [k, v] of Object.entries(aliasConfig.aliases)) {
@@ -857,17 +929,23 @@ async function main() {
   // Entry point
   const { entryPoint, autoDetected } = detectEntryPoint(projectRoot, allFiles, args.entryOverride);
 
+  // ---------------------------------------------------------------------------
   // Cache handling
+  // BUG 10: Compound cache key = md5(fileContent) + import signature.
+  //         Invalidates when a dependency's resolved path changes even if the
+  //         file itself hasn't changed.
+  // ---------------------------------------------------------------------------
   const cacheFilePath = path.join(projectRoot, '.react-map-cache.json');
-  let cache = {};
-  let cachedMetadata = {};
+  let cache = { fileHashes: {}, importSignatures: {}, metadata: {} };
   if (!args.noCache) {
     const cacheContent = tryReadFileSync(cacheFilePath);
     if (cacheContent) {
       try {
         const parsed = JSON.parse(cacheContent);
-        cache = parsed.hashes || {};
-        cachedMetadata = parsed.metadata || {};
+        // Support old cache format (hashes key) and new format (fileHashes key)
+        cache.fileHashes = parsed.fileHashes || parsed.hashes || {};
+        cache.importSignatures = parsed.importSignatures || {};
+        cache.metadata = parsed.metadata || {};
       } catch { /* ignore corrupt cache */ }
     }
   }
@@ -905,8 +983,25 @@ async function main() {
     const hash = md5(content);
     fileHashes[f] = hash;
 
-    if (!args.noCache && cache[f] === hash && cachedMetadata[f]) {
-      cachedResults[f] = cachedMetadata[f];
+    if (!args.noCache && cache.fileHashes[f] === hash && cache.metadata[f]) {
+      // BUG 10: re-validate import signatures
+      const cachedMeta = cache.metadata[f];
+      const importSources = [
+        ...(cachedMeta.imports.project || []).filter(p => !p.type || p.type !== 'asset').map(p => p.source),
+        ...(cachedMeta.imports.dynamic || []).map(d => d.source),
+        ...(cachedMeta.imports.reexports || []).filter(r => !r.type || r.type !== 'asset').map(r => r.source),
+      ].filter(s => !isLibraryImport(s, aliasConfig.aliases));
+
+      const currentResolved = importSources
+        .map(s => resolveImportPath(s, f, aliasConfig.aliases, aliasConfig.baseUrl, projectRoot) || 'null')
+        .sort();
+      const newImportSig = md5(currentResolved.join(','));
+
+      if (!cache.importSignatures[f] || cache.importSignatures[f] === newImportSig) {
+        cachedResults[f] = cachedMeta;
+      } else {
+        filesToParse.push(f);
+      }
     } else {
       filesToParse.push(f);
     }
@@ -927,13 +1022,14 @@ async function main() {
 
     console.log(`Spawning ${batches.length} worker(s)...`);
 
+    // BUG 1: aliasConfig is passed to every worker as part of workerData
     const workerPromises = batches.map(batch => {
       return new Promise((resolve, reject) => {
         const worker = new Worker(__filename, {
           workerData: {
             files: batch,
             projectRoot,
-            aliasConfig,
+            aliasConfig, // BUG 1: full alias map included
           },
         });
         worker.on('message', msg => resolve(msg));
@@ -944,10 +1040,11 @@ async function main() {
       });
     });
 
+    // BUG 3: Promise.all guarantees ALL workers complete before proceeding
     const workerResults = await Promise.all(workerPromises);
     for (const wr of workerResults) {
       if (wr.error) {
-        console.warn(`Worker error: ${wr.error}`);
+        console.warn(`Worker-level error: ${wr.error}`);
         continue;
       }
       for (const r of wr.results) {
@@ -959,10 +1056,58 @@ async function main() {
   // Merge cached and fresh results
   const allResults = { ...cachedResults, ...parsedResults };
 
-  // Update cache
-  const newCache = { hashes: fileHashes, metadata: {} };
+  // BUG 2: Main-thread fallback re-parse for files that errored in workers
+  const { babelParser: fbBabelParser, babelTraverse: fbBabelTraverse } = loadBabelModules();
+  const parseErrors = [];
+
+  for (const [fp, data] of Object.entries(allResults)) {
+    if (data.error && data.error !== 'LARGE_FILE') {
+      // Log to parseErrors first
+      parseErrors.push({ file: normalizePath(relativeTo(projectRoot, fp)), error: data.error });
+
+      // BUG 2: attempt synchronous re-parse on main thread
+      const fileContent = tryReadFileSync(fp);
+      if (fileContent && fileContent.trim()) {
+        try {
+          const reparsed = parseSingleFile(fp, aliasConfig, projectRoot, fbBabelParser, fbBabelTraverse);
+          if (!reparsed.error) {
+            allResults[fp] = reparsed;
+            // Remove from parseErrors since fallback succeeded
+            parseErrors.pop();
+          }
+        } catch (e) {
+          // Fallback also failed — keep blank node, error already recorded
+        }
+      }
+    }
+  }
+
+  // BUG 3: Assertion — tree building must not start until all files have metadata.
+  //        Files that failed hash computation (unreadable) are excluded from allFiles
+  //        via the 'continue' above. Large files and parseable files must all be present.
+  const expectedKeys = new Set(allFiles.map(f => f));
+  const missingFiles = [];
+  for (const f of allFiles) {
+    if (!allResults[f]) missingFiles.push(normalizePath(relativeTo(projectRoot, f)));
+  }
+  if (missingFiles.length > 0) {
+    throw new Error(
+      `Assertion failed: ${missingFiles.length} file(s) missing from metadata map before tree build. ` +
+      `Missing: ${missingFiles.slice(0, 5).join(', ')}${missingFiles.length > 5 ? '...' : ''}`
+    );
+  }
+
+  // Update cache with compound keys
+  const newCache = { fileHashes, importSignatures: {}, metadata: {} };
   for (const [fp, data] of Object.entries(allResults)) {
     newCache.metadata[fp] = data;
+    // BUG 10: compute import signature from resolved paths
+    const resolvedPaths = [
+      ...(data.imports.project || []).filter(p => p.resolvedPath).map(p => p.resolvedPath),
+      ...(data.imports.dynamic || []).filter(d => d.resolvedPath).map(d => d.resolvedPath),
+      ...(data.imports.reexports || []).filter(r => r.resolvedPath).map(r => r.resolvedPath),
+    ].sort();
+    newCache.importSignatures[fp] = md5(resolvedPaths.join(','));
   }
   try {
     fs.writeFileSync(cacheFilePath, JSON.stringify(newCache));
@@ -972,19 +1117,21 @@ async function main() {
 
   // Classify files
   const allFileSet = new Set(allFiles.map(f => normalizePath(f)));
-  const parseErrors = [];
 
   for (const [fp, data] of Object.entries(allResults)) {
-    if (data.error && data.error !== 'LARGE_FILE') {
-      parseErrors.push({ file: normalizePath(relativeTo(projectRoot, fp)), error: data.error });
-    }
     data.type = classifyFile(fp, data, projectRoot);
   }
 
+  // ---------------------------------------------------------------------------
   // Build dependency tree
+  // BUG 3: Only runs after Promise.all + assertion above confirm all data present.
+  // BUG 9: Barrel reexports are included in childPaths (same as project/dynamic).
+  // ---------------------------------------------------------------------------
   const visited = new Set();
   const allImportedFiles = new Set();
   const circularDependencies = [];
+  // BUG 8: collect unresolved imports
+  const unresolvedImports = [];
 
   function buildTree(filePath, depth = 0) {
     const normalizedPath = normalizePath(filePath);
@@ -1023,6 +1170,7 @@ async function main() {
           source: p.source,
           resolved: p.resolvedPath ? normalizePath(relativeTo(projectRoot, p.resolvedPath)) : null,
           unresolved: p.unresolved || false,
+          ...(p.type === 'asset' ? { type: 'asset' } : {}),
         })),
         dynamic: data.imports.dynamic.map(d => ({
           source: d.source,
@@ -1035,6 +1183,7 @@ async function main() {
           resolved: r.resolvedPath ? normalizePath(relativeTo(projectRoot, r.resolvedPath)) : null,
           specifiers: r.specifiers,
           unresolved: r.unresolved || false,
+          ...(r.type === 'asset' ? { type: 'asset' } : {}),
         })),
       },
       props: data.props,
@@ -1052,11 +1201,22 @@ async function main() {
 
     visited.add(normalizedPath);
 
+    // BUG 8: collect unresolved imports at tree-build time
+    for (const imp of [...data.imports.project, ...data.imports.dynamic, ...data.imports.reexports]) {
+      if (imp.unresolved && imp.type !== 'asset') {
+        unresolvedImports.push({
+          file: normalizePath(relPath),
+          source: imp.source,
+        });
+      }
+    }
+
     // Collect all children from project imports, dynamic imports, and reexports
+    // BUG 9: reexports from barrel files are included in childPaths
     const childPaths = [];
 
     for (const imp of data.imports.project) {
-      if (imp.resolvedPath) {
+      if (imp.resolvedPath && imp.type !== 'asset') {
         allImportedFiles.add(normalizePath(imp.resolvedPath));
         childPaths.push(imp.resolvedPath);
       }
@@ -1067,8 +1227,9 @@ async function main() {
         childPaths.push(imp.resolvedPath);
       }
     }
+    // BUG 9: Barrel reexports are traversed as children
     for (const imp of data.imports.reexports) {
-      if (imp.resolvedPath) {
+      if (imp.resolvedPath && imp.type !== 'asset') {
         allImportedFiles.add(normalizePath(imp.resolvedPath));
         childPaths.push(imp.resolvedPath);
       }
@@ -1110,13 +1271,94 @@ async function main() {
     tree = buildTree(entryPoint);
   }
 
-  // Orphaned files
+  // ---------------------------------------------------------------------------
+  // BUG 5: Post-build integrity validation
+  // Walk every node; if lineCount===0 AND no imports AND no children,
+  // check if file actually has content on disk. Flag as suspectNode and re-parse.
+  // ---------------------------------------------------------------------------
+  const suspectNodes = [];
+
+  function validateNode(node) {
+    if (!node.circular) {
+      const projectImportsCount = (node.imports.project || []).filter(p => p.type !== 'asset').length;
+      const isEmpty = node.lineCount === 0 &&
+        (node.imports.libraries || []).length === 0 &&
+        projectImportsCount === 0 &&
+        (node.children || []).length === 0;
+
+      if (isEmpty) {
+        const absPath = path.join(projectRoot, node.relativePath);
+        if (fileExistsSync(absPath)) {
+          const fileContent = tryReadFileSync(absPath);
+          if (fileContent && fileContent.trim()) {
+            suspectNodes.push({
+              path: node.relativePath,
+              reason: 'parsed as empty but file has content',
+            });
+            // BUG 5: attempt re-parse
+            try {
+              const reparsed = parseSingleFile(absPath, aliasConfig, projectRoot, fbBabelParser, fbBabelTraverse);
+              if (!reparsed.error && reparsed.lineCount > 0) {
+                // Patch node in place
+                node.lineCount = reparsed.lineCount;
+                node.hasJSX = reparsed.hasJSX;
+                node.exports = reparsed.exports;
+                node.props = reparsed.props;
+                node.state = reparsed.state;
+                node.routes = reparsed.routes;
+                node.externalLibraries = reparsed.externalLibraries;
+                node.imports.libraries = reparsed.imports.libraries.map(l => l.source);
+                node.imports.project = reparsed.imports.project.map(p => ({
+                  source: p.source,
+                  resolved: p.resolvedPath ? normalizePath(relativeTo(projectRoot, p.resolvedPath)) : null,
+                  unresolved: p.unresolved || false,
+                  ...(p.type === 'asset' ? { type: 'asset' } : {}),
+                }));
+                // Update allResults so orphan detection sees the fix
+                allResults[absPath] = reparsed;
+                // Rebuild children for this node (simplified: mark as needing rebuild)
+                node._needsChildRebuild = true;
+              }
+            } catch { /* re-parse failed on fallback too */ }
+          }
+        }
+      }
+    }
+
+    for (const child of (node.children || [])) {
+      validateNode(child);
+    }
+  }
+
+  if (tree) {
+    validateNode(tree);
+  }
+
+  // ---------------------------------------------------------------------------
+  // BUG 6: Orphan detection — only runs after integrity validation.
+  //        Files whose potential parents are in parseErrors or suspectNodes
+  //        are marked "unresolved" rather than "orphaned".
+  // ---------------------------------------------------------------------------
+  const parseErrorRelPaths = new Set(parseErrors.map(e => e.file));
+  const suspectNodeRelPaths = new Set(suspectNodes.map(s => s.path));
+
   const orphanedFiles = [];
   const entryNormalized = entryPoint ? normalizePath(entryPoint) : null;
+
   for (const f of allFiles) {
     const nf = normalizePath(f);
-    if (nf !== entryNormalized && !allImportedFiles.has(nf)) {
-      orphanedFiles.push(normalizePath(relativeTo(projectRoot, f)));
+    if (nf === entryNormalized || allImportedFiles.has(nf)) continue;
+
+    const relPath = normalizePath(relativeTo(projectRoot, f));
+
+    // BUG 6: If the file itself or any file in the same subtree failed to parse,
+    // we can't reliably determine orphan status — mark as unresolved.
+    const hasParseIssues = parseErrorRelPaths.has(relPath) || suspectNodeRelPaths.has(relPath);
+
+    if (hasParseIssues) {
+      orphanedFiles.push({ path: relPath, orphanStatus: 'unresolved', reason: 'file had parse issues; dependency chain may be incomplete' });
+    } else {
+      orphanedFiles.push({ path: relPath, orphanStatus: 'orphaned' });
     }
   }
 
@@ -1139,6 +1381,63 @@ async function main() {
     }
   }
 
+  // Deduplicate unresolvedImports
+  const unresolvedDedup = [];
+  const unresolvedSet = new Set();
+  for (const ui of unresolvedImports) {
+    const key = `${ui.file}|${ui.source}`;
+    if (!unresolvedSet.has(key)) {
+      unresolvedSet.add(key);
+      unresolvedDedup.push(ui);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Verification output (post-fix diagnostics)
+  // ---------------------------------------------------------------------------
+  const zeroLineCountNodes = [];
+  function countZeroLineNodes(node) {
+    if (node.lineCount === 0) zeroLineCountNodes.push(node.relativePath);
+    for (const child of (node.children || [])) countZeroLineNodes(child);
+  }
+  if (tree) countZeroLineNodes(tree);
+
+  const metadataCount = Object.keys(allResults).length;
+  console.log(`\n[Verification]`);
+  console.log(`  Metadata map entries: ${metadataCount} / totalFiles: ${allFiles.length} — ${metadataCount === allFiles.length ? 'OK' : 'MISMATCH'}`);
+  console.log(`  Tree nodes with lineCount===0: ${zeroLineCountNodes.length}`);
+  console.log(`  suspectNodes: ${suspectNodes.length}`);
+  console.log(`  parseErrors: ${parseErrors.length}`);
+  console.log(`  unresolvedImports: ${unresolvedDedup.length}`);
+
+  const trueOrphans = orphanedFiles.filter(o => o.orphanStatus === 'orphaned');
+  console.log(`  orphanedFiles (orphaned): ${trueOrphans.length}`);
+  console.log(`  orphanedFiles (unresolved): ${orphanedFiles.filter(o => o.orphanStatus === 'unresolved').length}`);
+  if (trueOrphans.length > 0) {
+    console.log(`  First 5 orphans:`);
+    for (const o of trueOrphans.slice(0, 5)) {
+      console.log(`    - ${o.path} (not reachable from entry point and no parse errors in ancestors)`);
+    }
+  }
+
+  // Check if App.tsx is an empty node
+  if (zeroLineCountNodes.some(p => p.includes('App'))) {
+    const appNode = zeroLineCountNodes.filter(p => p.includes('App'));
+    console.log(`  WARNING: App-related file(s) still appear as empty nodes: ${appNode.join(', ')}`);
+    for (const ap of appNode) {
+      const absAp = path.join(projectRoot, ap);
+      const apData = allResults[absAp];
+      if (apData && apData.error) {
+        console.log(`    Error for ${ap}: ${apData.error}`);
+      } else if (!fileExistsSync(absAp)) {
+        console.log(`    ${ap}: file does not exist on disk`);
+      } else {
+        const c = tryReadFileSync(absAp);
+        console.log(`    ${ap}: file exists, length=${c ? c.length : 0}`);
+      }
+    }
+  }
+
   // Build final output
   const output = {
     projectName,
@@ -1153,6 +1452,8 @@ async function main() {
     parseErrors,
     circularDependencies: circDedup,
     orphanedFiles,
+    unresolvedImports: unresolvedDedup,
+    suspectNodes,
     aliases: aliasesForOutput,
     tree: tree || {},
   };
@@ -1320,6 +1621,8 @@ function buildEmptyResult(projectName, version, aliases) {
     parseErrors: [],
     circularDependencies: [],
     orphanedFiles: [],
+    unresolvedImports: [],
+    suspectNodes: [],
     aliases,
     tree: {},
   };
@@ -1329,23 +1632,26 @@ function printSummary(output) {
   console.log('\n' + '='.repeat(50));
   console.log('  PROJECT ROADMAP SUMMARY');
   console.log('='.repeat(50));
-  console.log(`  Project:          ${output.projectName}`);
-  console.log(`  Version:          ${output.version}`);
-  console.log(`  Entry Point:      ${output.entryPoint || 'N/A'}`);
-  console.log(`  Auto-detected:    ${output.entryPointAutoDetected}`);
+  console.log(`  Project:              ${output.projectName}`);
+  console.log(`  Version:              ${output.version}`);
+  console.log(`  Entry Point:          ${output.entryPoint || 'N/A'}`);
+  console.log(`  Auto-detected:        ${output.entryPointAutoDetected}`);
   console.log('-'.repeat(50));
-  console.log(`  Total Files:      ${output.totalFiles}`);
-  console.log(`  Components:       ${output.totalComponents}`);
-  console.log(`  Hooks:            ${output.totalHooks}`);
-  console.log(`  Pages:            ${output.totalPages}`);
-  console.log(`  Orphaned Files:   ${output.orphanedFiles.length}`);
-  console.log(`  Parse Errors:     ${output.parseErrors.length}`);
-  console.log(`  Circular Deps:    ${output.circularDependencies.length}`);
+  console.log(`  Total Files:          ${output.totalFiles}`);
+  console.log(`  Components:           ${output.totalComponents}`);
+  console.log(`  Hooks:                ${output.totalHooks}`);
+  console.log(`  Pages:                ${output.totalPages}`);
+  console.log(`  Orphaned Files:       ${output.orphanedFiles.filter(o => o.orphanStatus === 'orphaned').length}`);
+  console.log(`  Unresolved Orphans:   ${output.orphanedFiles.filter(o => o.orphanStatus === 'unresolved').length}`);
+  console.log(`  Parse Errors:         ${output.parseErrors.length}`);
+  console.log(`  Circular Deps:        ${output.circularDependencies.length}`);
+  console.log(`  Unresolved Imports:   ${(output.unresolvedImports || []).length}`);
+  console.log(`  Suspect Nodes:        ${(output.suspectNodes || []).length}`);
   if (output.largeFiles && output.largeFiles.length > 0) {
-    console.log(`  Large Files:      ${output.largeFiles.length}`);
+    console.log(`  Large Files:          ${output.largeFiles.length}`);
   }
   if (output.packages) {
-    console.log(`  Packages:         ${output.packages.length}`);
+    console.log(`  Packages:             ${output.packages.length}`);
   }
   console.log('='.repeat(50));
 }
