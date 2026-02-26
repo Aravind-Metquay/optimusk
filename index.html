@@ -1,0 +1,336 @@
+<!doctype html>
+
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project Tree Viewer</title>
+
+    ```
+    <style>
+      :root {
+        --bg-color: #1e1e1e;
+        --text-color: #cccccc;
+        --hover-bg: #2a2d2e;
+        --border-color: #444444;
+        --accent-color: #007acc;
+        --badge-bg: #333333;
+        --badge-text: #9cdcfe;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        margin: 0;
+        padding: 20px;
+        line-height: 1.5;
+      }
+
+      .header {
+        margin-bottom: 20px;
+        padding-bottom: 20px;
+        border-bottom: 1px solid var(--border-color);
+      }
+
+      .header h1 {
+        margin: 0 0 10px 0;
+        color: #ffffff;
+        font-size: 1.5rem;
+      }
+
+      .stats {
+        display: flex;
+        gap: 15px;
+        font-size: 0.9rem;
+        color: #aaaaaa;
+      }
+
+      .stats span {
+        background: var(--badge-bg);
+        padding: 4px 8px;
+        border-radius: 4px;
+      }
+
+      .controls {
+        margin-bottom: 15px;
+      }
+
+      .btn {
+        background: var(--badge-bg);
+        color: var(--text-color);
+        border: 1px solid var(--border-color);
+        padding: 5px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        margin-right: 10px;
+      }
+
+      .btn:hover {
+        background: var(--hover-bg);
+      }
+
+      .tree-container {
+        font-family: "Consolas", "Courier New", monospace;
+        font-size: 0.9rem;
+      }
+
+      .node {
+        margin-left: 20px;
+        position: relative;
+      }
+
+      .node::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: -11px;
+        border-left: 1px solid var(--border-color);
+        z-index: 1;
+      }
+
+      .node:last-child::before {
+        bottom: auto;
+        height: 14px;
+      }
+
+      .node::after {
+        content: "";
+        position: absolute;
+        top: 14px;
+        left: -11px;
+        width: 10px;
+        border-top: 1px solid var(--border-color);
+        z-index: 1;
+      }
+
+      .label-row {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 6px;
+        border-radius: 4px;
+        cursor: default;
+        user-select: none;
+        position: relative;
+        z-index: 2;
+      }
+
+      .label-row:hover {
+        background-color: var(--hover-bg);
+      }
+
+      .clickable {
+        cursor: pointer;
+      }
+
+      .caret {
+        display: inline-block;
+        width: 16px;
+        text-align: center;
+        margin-right: 4px;
+        font-size: 0.7rem;
+        transition: transform 0.2s;
+      }
+
+      .caret.expanded {
+        transform: rotate(90deg);
+      }
+
+      .icon {
+        margin-right: 8px;
+        font-size: 1.1rem;
+      }
+
+      .name {
+        white-space: nowrap;
+      }
+
+      .badges {
+        display: flex;
+        gap: 6px;
+        margin-left: 12px;
+        opacity: 0.8;
+      }
+
+      .badge {
+        font-size: 0.7rem;
+        background: var(--badge-bg);
+        color: var(--badge-text);
+        padding: 1px 6px;
+        border-radius: 10px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .badge-lines {
+        color: #ce9178;
+      }
+
+      .children {
+        display: block;
+      }
+
+      .collapsed .children {
+        display: none;
+      }
+
+      #tree-root > .node {
+        margin-left: 0;
+      }
+
+      #tree-root > .node::before,
+      #tree-root > .node::after {
+        display: none;
+      }
+    </style>
+    ```
+  </head>
+
+  <body>
+    <div class="header">
+      <h1>Project: <span id="project-title">Loading...</span></h1>
+      <div class="stats" id="project-stats"></div>
+    </div>
+
+    ```
+    <div class="controls">
+      <button class="btn" onclick="toggleAll(true)">Expand All</button>
+      <button class="btn" onclick="toggleAll(false)">Collapse All</button>
+    </div>
+
+    <div id="tree-root" class="tree-container"></div>
+
+    <script>
+      // Load JSON
+      fetch("./project-roadmap.json")
+        .then((res) => res.json())
+        .then((data) => init(data))
+        .catch((err) => console.error("Failed to load JSON:", err));
+
+      function init(projectData) {
+        document.getElementById("project-title").textContent =
+          `${projectData.projectName} (v${projectData.version})`;
+
+        document.getElementById("project-stats").innerHTML = `
+      <span>Files: ${projectData.totalFiles}</span>
+      <span>Components: ${projectData.totalComponents}</span>
+      <span>Hooks: ${projectData.totalHooks}</span>
+      <span>Unresolved Imports: ${projectData.unresolvedImports?.length || 0}</span>
+    `;
+
+        const treeRoot = document.getElementById("tree-root");
+        if (projectData.tree) {
+          treeRoot.appendChild(renderNode(projectData.tree));
+        }
+      }
+
+      function getIcon(type, name) {
+        if (name.endsWith(".tsx") && type === "Component") return "⚛️";
+        if (type === "Hook") return "🪝";
+        if (type === "Context") return "🧠";
+        if (type === "Router") return "🛣️";
+        if (type === "TypeDefinition") return "🇹";
+        if (type === "Module" || type === "Root") return "📁";
+        if (name.endsWith(".css")) return "🎨";
+        if (name.endsWith(".ts")) return "📝";
+        return "📄";
+      }
+
+      function renderNode(node) {
+        const nodeDiv = document.createElement("div");
+        nodeDiv.className = "node";
+
+        const hasChildren = node.children && node.children.length > 0;
+
+        if (hasChildren) nodeDiv.classList.add("expanded");
+
+        const labelRow = document.createElement("div");
+        labelRow.className = `label-row ${hasChildren ? "clickable" : ""}`;
+
+        const caret = document.createElement("span");
+        caret.className = "caret";
+
+        if (hasChildren) {
+          caret.textContent = "▶";
+          caret.classList.add("expanded");
+
+          labelRow.onclick = (e) => {
+            e.stopPropagation();
+            nodeDiv.classList.toggle("collapsed");
+            caret.classList.toggle("expanded");
+          };
+        } else {
+          caret.innerHTML = "&nbsp;";
+        }
+
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.textContent = getIcon(node.type || "", node.name || "");
+
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "name";
+        nameSpan.textContent = node.name;
+
+        const badgesDiv = document.createElement("div");
+        badgesDiv.className = "badges";
+
+        if (node.type) {
+          const typeBadge = document.createElement("span");
+          typeBadge.className = "badge";
+          typeBadge.textContent = node.type;
+          badgesDiv.appendChild(typeBadge);
+        }
+
+        if (node.lineCount !== undefined && node.lineCount > 0) {
+          const linesBadge = document.createElement("span");
+          linesBadge.className = "badge badge-lines";
+          linesBadge.textContent = `${node.lineCount} lines`;
+          badgesDiv.appendChild(linesBadge);
+        }
+
+        labelRow.appendChild(caret);
+        labelRow.appendChild(icon);
+        labelRow.appendChild(nameSpan);
+        labelRow.appendChild(badgesDiv);
+
+        nodeDiv.appendChild(labelRow);
+
+        if (hasChildren) {
+          const childrenContainer = document.createElement("div");
+          childrenContainer.className = "children";
+
+          node.children.forEach((child) => {
+            childrenContainer.appendChild(renderNode(child));
+          });
+
+          nodeDiv.appendChild(childrenContainer);
+        }
+
+        return nodeDiv;
+      }
+
+      function toggleAll(expand) {
+        const nodes = document.querySelectorAll(".node");
+        const carets = document.querySelectorAll(".caret");
+
+        nodes.forEach((node) => {
+          if (node.querySelector(".children")) {
+            if (expand) node.classList.remove("collapsed");
+            else node.classList.add("collapsed");
+          }
+        });
+
+        carets.forEach((caret) => {
+          if (caret.textContent === "▶") {
+            if (expand) caret.classList.add("expanded");
+            else caret.classList.remove("expanded");
+          }
+        });
+      }
+    </script>
+    ```
+  </body>
+</html>
